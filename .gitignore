@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Java build artifacts
+build/
+*.class
+
+# OS / editors
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.~lock*
+
+# Raw data and local outputs
+data/raw/
+results/*
+!results/.gitkeep
+
+# Local archives and ad-hoc exports
+*.rar
+*.zip
+analysis_output*/
+analysis_probe*/
