@@ -1,0 +1,7 @@
+image_name;well_index;plate_key;capture_index;dose_gy;dose_unit;row_name;replicate;concentration;condition_name;condition_value;cell_line;sample_name
+0_Gy_0,3_0,15.tif;1;0_Gy_0,3_0,15;1;0;Gy;top;1;0.3;concentration;0.3;4T1;UiO-66 (Hf)
+0_Gy_0,3_0,15.tif;2;0_Gy_0,3_0,15;1;0;Gy;top;2;0.3;concentration;0.3;4T1;UiO-66 (Hf)
+0_Gy_0,3_0,15.tif;3;0_Gy_0,3_0,15;1;0;Gy;top;3;0.3;concentration;0.3;4T1;UiO-66 (Hf)
+0_Gy_0,3_0,15.tif;4;0_Gy_0,3_0,15;1;0;Gy;bottom;1;0.15;concentration;0.15;4T1;UiO-66 (Hf)
+0_Gy_0,3_0,15.tif;5;0_Gy_0,3_0,15;1;0;Gy;bottom;2;0.15;concentration;0.15;4T1;UiO-66 (Hf)
+0_Gy_0,3_0,15.tif;6;0_Gy_0,3_0,15;1;0;Gy;bottom;3;0.15;concentration;0.15;4T1;UiO-66 (Hf)

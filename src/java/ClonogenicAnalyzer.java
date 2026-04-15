@@ -32,12 +32,15 @@ import java.nio.file.Paths;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Properties;
 import java.util.Set;
 import javax.imageio.ImageIO;
 
@@ -292,7 +295,11 @@ public final class ClonogenicAnalyzer {
     // Уменьшение: rescue становится мягче. Разумно: 1.8-3.5.
     private static final double TUNE_BORDERLINE_THRESHOLD_SCALE = 2.7;
 
-    private static final Config CONFIG = new Config();
+    private static Config CONFIG = new Config();
+    private static List<LayoutSeed> CUSTOM_LAYOUT = List.of();
+    private static ManifestIndex MANIFEST = ManifestIndex.empty();
+    private static List<String> SUMMARY_GROUP_FIELDS = List.of();
+    private static DatasetMode EFFECTIVE_DATASET_MODE = DatasetMode.AUTO;
 
     private record Config(
         double backgroundSigmaScale,
@@ -336,11 +343,60 @@ public final class ClonogenicAnalyzer {
                 TUNE_SCAN_STRONG_THRESHOLD_FACTOR
             );
         }
+
+        static Config fromProperties(Properties properties) {
+            Config defaults = new Config();
+            return new Config(
+                getDouble(properties, "background_sigma_scale", defaults.backgroundSigmaScale()),
+                getDouble(properties, "score_quantile", defaults.scoreQuantile()),
+                getInt(properties, "min_colony_area", defaults.minColonyArea()),
+                getDouble(properties, "threshold_relaxation", defaults.thresholdRelaxation()),
+                getDouble(properties, "clump_area_factor", defaults.clumpAreaFactor()),
+                getDouble(properties, "neighbor_radius_scale", defaults.neighborRadiusScale()),
+                getInt(properties, "count_mask_erosion_px", defaults.countMaskErosionPx()),
+                getDouble(properties, "outer_reject_band_px", defaults.outerRejectBandPx()),
+                getDouble(properties, "isolated_small_area_scale", defaults.isolatedSmallAreaScale()),
+                getDouble(properties, "isolated_support_area_scale", defaults.isolatedSupportAreaScale()),
+                getDouble(properties, "min_area_scale_scan", defaults.minAreaScaleScan()),
+                getDouble(properties, "min_area_scale_photo", defaults.minAreaScalePhoto()),
+                getDouble(properties, "split_coverage_fraction", defaults.splitCoverageFraction()),
+                getDouble(properties, "scan_max_dim", defaults.scanMaxDim()),
+                getDouble(properties, "well_crop_scale", defaults.wellCropScale()),
+                getDouble(properties, "scan_roi_left_fraction", defaults.scanRoiLeftFraction()),
+                getDouble(properties, "scan_roi_top_fraction", defaults.scanRoiTopFraction()),
+                getDouble(properties, "scan_threshold_factor", defaults.scanThresholdFactor())
+            );
+        }
     }
 
-    private record Args(Path outputDir, List<Path> inputs) {}
+    private enum DatasetMode {
+        AUTO,
+        HF,
+        ZR;
+
+        static DatasetMode parse(String raw) {
+            String normalized = raw.trim().toLowerCase(Locale.ROOT);
+            return switch (normalized) {
+                case "auto" -> AUTO;
+                case "hf" -> HF;
+                case "zr" -> ZR;
+                default -> throw new IllegalArgumentException("Unsupported --dataset value: " + raw + ". Expected one of: auto, hf, zr");
+            };
+        }
+    }
+
+    private record Args(
+        Path outputDir,
+        DatasetMode datasetMode,
+        Path settingsPath,
+        Path layoutPath,
+        Path manifestPath,
+        List<Path> inputs
+    ) {}
 
     private record Circle(double x, double y, double radius, double score) {}
+
+    private record LayoutSeed(int wellIndex, double xFraction, double yFraction, double radiusFraction) {}
 
     private record Box(int left, int top, int right, int bottom) {
         int width() {
@@ -360,8 +416,34 @@ public final class ClonogenicAnalyzer {
         String doseUnit,
         Double topConcentration,
         Double bottomConcentration,
-        boolean reverseColumnAssignments
+        boolean reverseColumnAssignments,
+        Map<String, Object> imageFields,
+        Map<Integer, Map<String, Object>> wellFields
     ) {}
+
+    private record WellAssignment(
+        String rowName,
+        Double concentration,
+        int replicate,
+        Map<String, Object> extraFields
+    ) {}
+
+    private record ManifestIndex(
+        Map<String, Map<Integer, Map<String, Object>>> byImageName,
+        Map<String, Map<Integer, Map<String, Object>>> byImageStem
+    ) {
+        static ManifestIndex empty() {
+            return new ManifestIndex(Map.of(), Map.of());
+        }
+
+        Map<Integer, Map<String, Object>> rowsForImage(String imageName) {
+            Map<Integer, Map<String, Object>> direct = byImageName.get(imageName);
+            if (direct != null) {
+                return direct;
+            }
+            return byImageStem.getOrDefault(stripExtension(imageName), Map.of());
+        }
+    }
 
     private record AnalysisFrame(
         BufferedImage image,
@@ -415,6 +497,7 @@ public final class ClonogenicAnalyzer {
         String rowName,
         Double concentration,
         int replicate,
+        Map<String, Object> extraFields,
         int areaPx,
         double eccentricity,
         double circularity,
@@ -435,6 +518,7 @@ public final class ClonogenicAnalyzer {
         String rowName,
         int replicate,
         Double concentration,
+        Map<String, Object> extraFields,
         int rawComponentCount,
         int countedColonies,
         double singleAreaPx,
@@ -461,13 +545,14 @@ public final class ClonogenicAnalyzer {
 
     public static void main(String[] args) throws Exception {
         Args parsed = parseArgs(args);
+        applyExternalConfiguration(parsed);
         Files.createDirectories(parsed.outputDir);
 
         List<Map<String, Object>> allWellRows = new ArrayList<>();
         List<Map<String, Object>> runSummaries = new ArrayList<>();
 
         for (Path input : parsed.inputs) {
-            Map<String, Object> summary = analyzeImage(input, parsed.outputDir, allWellRows);
+            Map<String, Object> summary = analyzeImage(input, parsed.outputDir, EFFECTIVE_DATASET_MODE, allWellRows);
             runSummaries.add(summary);
         }
 
@@ -501,16 +586,28 @@ public final class ClonogenicAnalyzer {
 
     private static Args parseArgs(String[] args) throws IOException {
         Path outputDir = Path.of("analysis_output_java");
+        DatasetMode datasetMode = DatasetMode.AUTO;
+        Path settingsPath = null;
+        Path layoutPath = null;
+        Path manifestPath = null;
         List<String> rawInputs = new ArrayList<>();
         for (int i = 0; i < args.length; i++) {
             if ("--output-dir".equals(args[i]) && i + 1 < args.length) {
                 outputDir = Path.of(args[++i]).toAbsolutePath().normalize();
+            } else if ("--dataset".equals(args[i]) && i + 1 < args.length) {
+                datasetMode = DatasetMode.parse(args[++i]);
+            } else if ("--config".equals(args[i]) && i + 1 < args.length) {
+                settingsPath = Path.of(args[++i]).toAbsolutePath().normalize();
+            } else if ("--layout".equals(args[i]) && i + 1 < args.length) {
+                layoutPath = Path.of(args[++i]).toAbsolutePath().normalize();
+            } else if ("--manifest".equals(args[i]) && i + 1 < args.length) {
+                manifestPath = Path.of(args[++i]).toAbsolutePath().normalize();
             } else {
                 rawInputs.add(args[i]);
             }
         }
         if (rawInputs.isEmpty()) {
-            throw new IllegalArgumentException("Usage: java ClonogenicAnalyzer [--output-dir DIR] <images...>");
+            throw new IllegalArgumentException("Usage: java ClonogenicAnalyzer [--output-dir DIR] [--dataset auto|hf|zr] [--config settings.properties] [--layout well_layout.csv] [--manifest plate_manifest.csv] <images...>");
         }
 
         List<Path> inputs = new ArrayList<>();
@@ -534,18 +631,191 @@ public final class ClonogenicAnalyzer {
         if (inputs.isEmpty()) {
             throw new IllegalArgumentException("No input images matched the provided paths.");
         }
-        return new Args(outputDir, inputs);
+        return new Args(outputDir, datasetMode, settingsPath, layoutPath, manifestPath, inputs);
+    }
+
+    private static void applyExternalConfiguration(Args parsed) throws IOException {
+        CONFIG = new Config();
+        CUSTOM_LAYOUT = List.of();
+        MANIFEST = ManifestIndex.empty();
+        SUMMARY_GROUP_FIELDS = List.of();
+        EFFECTIVE_DATASET_MODE = parsed.datasetMode();
+
+        if (parsed.settingsPath() != null) {
+            Properties properties = new Properties();
+            try (BufferedReader reader = Files.newBufferedReader(parsed.settingsPath(), StandardCharsets.UTF_8)) {
+                properties.load(reader);
+            }
+            CONFIG = Config.fromProperties(properties);
+            SUMMARY_GROUP_FIELDS = parseListProperty(properties.getProperty("summary_group_fields"));
+            if (EFFECTIVE_DATASET_MODE == DatasetMode.AUTO) {
+                String configuredMode = properties.getProperty("dataset_mode");
+                if (configuredMode != null && !configuredMode.isBlank()) {
+                    EFFECTIVE_DATASET_MODE = DatasetMode.parse(configuredMode);
+                }
+            }
+        }
+
+        if (parsed.layoutPath() != null) {
+            CUSTOM_LAYOUT = loadLayoutSeeds(parsed.layoutPath());
+        }
+        if (parsed.manifestPath() != null) {
+            MANIFEST = loadManifest(parsed.manifestPath());
+        }
+    }
+
+    private static List<String> parseListProperty(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return List.of();
+        }
+        String[] parts = raw.split(",");
+        List<String> values = new ArrayList<>();
+        for (String part : parts) {
+            String trimmed = part.trim();
+            if (!trimmed.isEmpty()) {
+                values.add(trimmed);
+            }
+        }
+        return values;
+    }
+
+    private static double getDouble(Properties properties, String key, double defaultValue) {
+        String raw = properties.getProperty(key);
+        if (raw == null || raw.isBlank()) {
+            return defaultValue;
+        }
+        return Double.parseDouble(raw.trim().replace(',', '.'));
+    }
+
+    private static int getInt(Properties properties, String key, int defaultValue) {
+        String raw = properties.getProperty(key);
+        if (raw == null || raw.isBlank()) {
+            return defaultValue;
+        }
+        return Integer.parseInt(raw.trim());
+    }
+
+    private static List<LayoutSeed> loadLayoutSeeds(Path path) throws IOException {
+        CsvTable table = readCsvTable(path);
+        List<LayoutSeed> seeds = new ArrayList<>();
+        for (Map<String, String> row : table.rows()) {
+            int wellIndex = parseRequiredInt(row, "well_index", path);
+            double xFraction = parseRequiredDouble(row, "x_fraction", path);
+            double yFraction = parseRequiredDouble(row, "y_fraction", path);
+            double radiusFraction = parseRequiredDouble(row, "radius_fraction", path);
+            seeds.add(new LayoutSeed(wellIndex, xFraction, yFraction, radiusFraction));
+        }
+        seeds.sort(Comparator.comparingInt(LayoutSeed::wellIndex));
+        return seeds;
+    }
+
+    private static ManifestIndex loadManifest(Path path) throws IOException {
+        CsvTable table = readCsvTable(path);
+        Map<String, Map<Integer, Map<String, Object>>> byImageName = new LinkedHashMap<>();
+        Map<String, Map<Integer, Map<String, Object>>> byImageStem = new LinkedHashMap<>();
+        for (Map<String, String> row : table.rows()) {
+            String imageName = row.getOrDefault("image_name", "").trim();
+            if (imageName.isEmpty()) {
+                throw new IllegalArgumentException("Manifest row without image_name in " + path);
+            }
+            int wellIndex = parseRequiredInt(row, "well_index", path);
+            Map<String, Object> values = new LinkedHashMap<>();
+            for (Map.Entry<String, String> entry : row.entrySet()) {
+                String key = entry.getKey();
+                String value = entry.getValue();
+                if (value == null || value.isBlank()) {
+                    continue;
+                }
+                values.put(key, value.trim());
+            }
+            byImageName.computeIfAbsent(imageName, unused -> new LinkedHashMap<>()).put(wellIndex, values);
+            byImageStem.computeIfAbsent(stripExtension(imageName), unused -> new LinkedHashMap<>()).put(wellIndex, values);
+        }
+        return new ManifestIndex(byImageName, byImageStem);
+    }
+
+    private record CsvTable(List<String> headers, List<Map<String, String>> rows) {}
+
+    private static CsvTable readCsvTable(Path path) throws IOException {
+        List<String> lines = Files.readAllLines(path, StandardCharsets.UTF_8);
+        if (lines.isEmpty()) {
+            throw new IllegalArgumentException("Empty CSV file: " + path);
+        }
+        char delimiter = detectDelimiter(lines.getFirst());
+        List<String> headers = parseCsvLine(lines.getFirst(), delimiter);
+        List<Map<String, String>> rows = new ArrayList<>();
+        for (int i = 1; i < lines.size(); i++) {
+            String line = lines.get(i);
+            if (line == null || line.isBlank()) {
+                continue;
+            }
+            List<String> values = parseCsvLine(line, delimiter);
+            Map<String, String> row = new LinkedHashMap<>();
+            for (int col = 0; col < headers.size(); col++) {
+                String value = col < values.size() ? values.get(col) : "";
+                row.put(headers.get(col).trim(), value.trim());
+            }
+            rows.add(row);
+        }
+        return new CsvTable(headers, rows);
+    }
+
+    private static char detectDelimiter(String header) {
+        long semicolons = header.chars().filter(ch -> ch == ';').count();
+        long commas = header.chars().filter(ch -> ch == ',').count();
+        return semicolons > commas ? ';' : ',';
+    }
+
+    private static List<String> parseCsvLine(String line, char delimiter) {
+        List<String> out = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+        boolean inQuotes = false;
+        for (int i = 0; i < line.length(); i++) {
+            char ch = line.charAt(i);
+            if (ch == '"') {
+                if (inQuotes && i + 1 < line.length() && line.charAt(i + 1) == '"') {
+                    current.append('"');
+                    i++;
+                } else {
+                    inQuotes = !inQuotes;
+                }
+            } else if (ch == delimiter && !inQuotes) {
+                out.add(current.toString());
+                current.setLength(0);
+            } else {
+                current.append(ch);
+            }
+        }
+        out.add(current.toString());
+        return out;
+    }
+
+    private static int parseRequiredInt(Map<String, String> row, String key, Path path) {
+        String value = row.getOrDefault(key, "").trim();
+        if (value.isEmpty()) {
+            throw new IllegalArgumentException("Missing required integer field '" + key + "' in " + path);
+        }
+        return Integer.parseInt(value);
+    }
+
+    private static double parseRequiredDouble(Map<String, String> row, String key, Path path) {
+        String value = row.getOrDefault(key, "").trim();
+        if (value.isEmpty()) {
+            throw new IllegalArgumentException("Missing required numeric field '" + key + "' in " + path);
+        }
+        return Double.parseDouble(value.replace(',', '.'));
     }
 
     private static Map<String, Object> analyzeImage(
         Path imagePath,
         Path outputRoot,
+        DatasetMode datasetMode,
         List<Map<String, Object>> allWellRows
     ) throws Exception {
         Path imageOutputDir = outputRoot.resolve(stripExtension(imagePath.getFileName().toString()));
         Files.createDirectories(imageOutputDir);
 
-        Metadata metadata = parseMetadata(imagePath);
+        Metadata metadata = parseMetadata(imagePath, datasetMode);
         BufferedImage source = openBuffered(imagePath);
         AnalysisFrame frame = prepareAnalysisFrame(imagePath, source, imageOutputDir);
 
@@ -585,6 +855,7 @@ public final class ClonogenicAnalyzer {
             WellRegion region = wellRegions.get(i);
             WellSummary summary = wellSummaries.get(i);
             Map<String, Object> row = baseMetadataMap(metadata);
+            row.putAll(summary.extraFields());
             row.put("well_index", summary.wellIndex());
             row.put("row_name", summary.rowName());
             row.put("replicate", summary.replicate());
@@ -617,6 +888,7 @@ public final class ClonogenicAnalyzer {
         for (int i = 0; i < allSegments.size(); i++) {
             SegmentRecord segment = allSegments.get(i);
             Map<String, Object> row = baseMetadataMap(metadata);
+            row.putAll(segment.extraFields());
             row.put("segment_index", i + 1);
             row.put("well_index", segment.wellIndex());
             row.put("row_name", segment.rowName());
@@ -917,6 +1189,22 @@ public final class ClonogenicAnalyzer {
     }
 
     private static List<Circle> createScanSeedCircles(int width, int height) {
+        if (!CUSTOM_LAYOUT.isEmpty()) {
+            List<Circle> seeds = new ArrayList<>();
+            double minDim = Math.min(width, height);
+            for (LayoutSeed seed : CUSTOM_LAYOUT) {
+                seeds.add(
+                    new Circle(
+                        width * seed.xFraction(),
+                        height * seed.yFraction(),
+                        minDim * seed.radiusFraction(),
+                        1.0
+                    )
+                );
+            }
+            return seeds;
+        }
+
         boolean portrait = height > width * 1.1;
         List<Circle> seeds = new ArrayList<>();
         if (portrait) {
@@ -1055,9 +1343,10 @@ public final class ClonogenicAnalyzer {
         double[][] edgeDistance = distanceTransform(mask);
 
         List<SegmentRecord> kept = new ArrayList<>();
-        String rowName = region.wellIndex() <= 3 ? "top" : "bottom";
-        Double concentration = concentrationForWell(metadata, region.wellIndex());
-        int replicate = rowName.equals("top") ? region.wellIndex() : region.wellIndex() - 3;
+        WellAssignment assignment = resolveWellAssignment(metadata, region.wellIndex());
+        String rowName = assignment.rowName();
+        Double concentration = assignment.concentration();
+        int replicate = assignment.replicate();
         int labelIndex = 0;
         double minAreaScale = scanLike ? CONFIG.minAreaScaleScan() : CONFIG.minAreaScalePhoto();
 
@@ -1096,7 +1385,7 @@ public final class ClonogenicAnalyzer {
                 && particle.meanPurple() < 0.12) {
                 continue;
             }
-            kept.add(toSegmentRecord(particle, region, rowName, concentration, replicate, labelIndex++));
+            kept.add(toSegmentRecord(particle, region, rowName, concentration, replicate, assignment.extraFields(), labelIndex++));
         }
 
         boolean[][] countedLocal = new boolean[mask.length][mask[0].length];
@@ -1147,7 +1436,7 @@ public final class ClonogenicAnalyzer {
                         continue;
                     }
 
-                    SegmentRecord rescued = toSegmentRecord(particle, region, rowName, concentration, replicate, labelIndex++);
+                    SegmentRecord rescued = toSegmentRecord(particle, region, rowName, concentration, replicate, assignment.extraFields(), labelIndex++);
                     kept.add(rescued);
                     paintRoiMask(countedLocal, rescued.roiGlobal(), region.cropBox().left(), region.cropBox().top());
                 }
@@ -1188,7 +1477,7 @@ public final class ClonogenicAnalyzer {
                         for (int index : members) {
                             removed.add(index);
                         }
-                        mergedBack.add(toSegmentRecord(particle, region, rowName, concentration, replicate, labelIndex++));
+                        mergedBack.add(toSegmentRecord(particle, region, rowName, concentration, replicate, assignment.extraFields(), labelIndex++));
                     }
 
                     if (!removed.isEmpty()) {
@@ -1217,6 +1506,7 @@ public final class ClonogenicAnalyzer {
             rowName,
             replicate,
             concentration,
+            assignment.extraFields(),
             rawParticles.size(),
             kept.size(),
             singleArea,
@@ -1650,6 +1940,7 @@ public final class ClonogenicAnalyzer {
         String rowName,
         Double concentration,
         int replicate,
+        Map<String, Object> extraFields,
         int labelIndex
     ) {
         Roi shifted = shiftRoi(particle.roiLocal(), region.cropBox().left(), region.cropBox().top());
@@ -1659,6 +1950,7 @@ public final class ClonogenicAnalyzer {
             rowName,
             concentration,
             replicate,
+            new LinkedHashMap<>(extraFields),
             particle.area(),
             particle.eccentricity(),
             particle.circularity(),
@@ -1685,6 +1977,7 @@ public final class ClonogenicAnalyzer {
                     segment.rowName(),
                     segment.concentration(),
                     segment.replicate(),
+                    new LinkedHashMap<>(segment.extraFields()),
                     segment.areaPx(),
                     segment.eccentricity(),
                     segment.circularity(),
@@ -2310,7 +2603,7 @@ public final class ClonogenicAnalyzer {
         return count;
     }
 
-    private static Metadata parseMetadata(Path imagePath) {
+    private static Metadata parseMetadata(Path imagePath, DatasetMode datasetMode) {
         String imageName = imagePath.getFileName().toString();
         String stem = stripExtension(imageName);
         int captureIndex = 1;
@@ -2328,8 +2621,29 @@ public final class ClonogenicAnalyzer {
         String doseUnit = tokens.length >= 2 ? tokens[1] : null;
         Double top = tokens.length >= 3 ? parseConcentrationToken(tokens[2]) : null;
         Double bottom = tokens.length >= 4 ? parseConcentrationToken(tokens[3]) : null;
-        boolean reverseColumnAssignments = isZrDataset(imagePath) && !isZrNormalOrientationControl(doseGy, top, bottom);
-        return new Metadata(imageName, plateKey, captureIndex, doseGy, doseUnit, top, bottom, reverseColumnAssignments);
+        Map<Integer, Map<String, Object>> manifestRows = MANIFEST.rowsForImage(imageName);
+        Map<String, Object> imageFields = new LinkedHashMap<>();
+        if (!manifestRows.isEmpty()) {
+            Map<String, Object> first = manifestRows.values().iterator().next();
+            plateKey = stringField(first, "plate_key", plateKey);
+            captureIndex = intField(first, "capture_index", captureIndex);
+            doseGy = doubleField(first, "dose_gy", doseGy);
+            doseUnit = stringField(first, "dose_unit", doseUnit);
+            top = doubleField(first, "top_concentration", top);
+            bottom = doubleField(first, "bottom_concentration", bottom);
+            imageFields.putAll(collectCommonImageFields(manifestRows));
+        }
+        boolean reverseColumnAssignments = isZrDataset(imagePath, datasetMode) && !isZrNormalOrientationControl(doseGy, top, bottom);
+        imageFields.put("image_name", imageName);
+        imageFields.put("plate_key", plateKey);
+        imageFields.put("capture_index", captureIndex);
+        if (doseGy != null) {
+            imageFields.put("dose_gy", formatNumberObject(doseGy));
+        }
+        if (doseUnit != null) {
+            imageFields.put("dose_unit", doseUnit);
+        }
+        return new Metadata(imageName, plateKey, captureIndex, doseGy, doseUnit, top, bottom, reverseColumnAssignments, imageFields, manifestRows);
     }
 
     private static Double parseDecimal(String raw) {
@@ -2351,7 +2665,13 @@ public final class ClonogenicAnalyzer {
         return parseDecimal(raw);
     }
 
-    private static boolean isZrDataset(Path imagePath) {
+    private static boolean isZrDataset(Path imagePath, DatasetMode datasetMode) {
+        if (datasetMode == DatasetMode.ZR) {
+            return true;
+        }
+        if (datasetMode == DatasetMode.HF) {
+            return false;
+        }
         String fullPath = imagePath.toString().toLowerCase(Locale.ROOT);
         return fullPath.contains("clon zr egor") || fullPath.contains("/zr/") || fullPath.contains("\\zr\\");
     }
@@ -2372,13 +2692,118 @@ public final class ClonogenicAnalyzer {
         return leftColumn ? metadata.topConcentration() : metadata.bottomConcentration();
     }
 
+    private static WellAssignment resolveWellAssignment(Metadata metadata, int wellIndex) {
+        String defaultRowName;
+        Double defaultConcentration;
+        int defaultReplicate;
+        if (metadata.wellFields().isEmpty() && CUSTOM_LAYOUT.isEmpty()) {
+            defaultRowName = wellIndex <= 3 ? "top" : "bottom";
+            defaultConcentration = concentrationForWell(metadata, wellIndex);
+            defaultReplicate = defaultRowName.equals("top") ? wellIndex : wellIndex - 3;
+        } else {
+            defaultRowName = "group_1";
+            defaultConcentration = null;
+            defaultReplicate = wellIndex;
+        }
+
+        Map<String, Object> manifestRow = metadata.wellFields().getOrDefault(wellIndex, Map.of());
+        String rowName = stringField(manifestRow, "row_name", defaultRowName);
+        Double concentration = doubleField(manifestRow, "concentration", defaultConcentration);
+        int replicate = intField(manifestRow, "replicate", defaultReplicate);
+
+        Map<String, Object> extraFields = new LinkedHashMap<>();
+        extraFields.put("position_label", "W" + wellIndex);
+        for (Map.Entry<String, Object> entry : manifestRow.entrySet()) {
+            String key = entry.getKey();
+            if (isImageLevelField(key) || isStandardWellField(key)) {
+                continue;
+            }
+            extraFields.put(key, entry.getValue());
+        }
+        return new WellAssignment(rowName, concentration, replicate, extraFields);
+    }
+
+    private static boolean isStandardWellField(String key) {
+        return "image_name".equals(key)
+            || "well_index".equals(key)
+            || "row_name".equals(key)
+            || "replicate".equals(key)
+            || "concentration".equals(key);
+    }
+
+    private static boolean isImageLevelField(String key) {
+        return "plate_key".equals(key)
+            || "capture_index".equals(key)
+            || "dose_gy".equals(key)
+            || "dose_unit".equals(key)
+            || "top_concentration".equals(key)
+            || "bottom_concentration".equals(key);
+    }
+
+    private static Object formatNumberObject(Double value) {
+        if (value == null) {
+            return null;
+        }
+        return round(value, 6);
+    }
+
+    private static Map<String, Object> collectCommonImageFields(Map<Integer, Map<String, Object>> manifestRows) {
+        if (manifestRows.isEmpty()) {
+            return Map.of();
+        }
+        Map<String, Object> first = manifestRows.values().iterator().next();
+        Map<String, Object> common = new LinkedHashMap<>();
+        for (Map.Entry<String, Object> entry : first.entrySet()) {
+            String key = entry.getKey();
+            if ("well_index".equals(key) || "image_name".equals(key)) {
+                continue;
+            }
+            boolean same = true;
+            for (Map<String, Object> row : manifestRows.values()) {
+                Object other = row.get(key);
+                if (other == null || !other.toString().equals(entry.getValue().toString())) {
+                    same = false;
+                    break;
+                }
+            }
+            if (same) {
+                common.put(key, entry.getValue());
+            }
+        }
+        return common;
+    }
+
+    private static String stringField(Map<String, Object> row, String key, String defaultValue) {
+        Object value = row.get(key);
+        if (value == null || value.toString().isBlank()) {
+            return defaultValue;
+        }
+        return value.toString().trim();
+    }
+
+    private static int intField(Map<String, Object> row, String key, int defaultValue) {
+        Object value = row.get(key);
+        if (value == null || value.toString().isBlank()) {
+            return defaultValue;
+        }
+        return Integer.parseInt(value.toString().trim());
+    }
+
+    private static Double doubleField(Map<String, Object> row, String key, Double defaultValue) {
+        Object value = row.get(key);
+        if (value == null || value.toString().isBlank()) {
+            return defaultValue;
+        }
+        return parseDecimal(value.toString());
+    }
+
     private static String stripExtension(String name) {
         int index = name.lastIndexOf('.');
         return index >= 0 ? name.substring(0, index) : name;
     }
 
     private static Map<String, Object> baseMetadataMap(Metadata metadata) {
-        Map<String, Object> map = new HashMap<>();
+        Map<String, Object> map = new LinkedHashMap<>();
         map.put("image_name", metadata.imageName());
         map.put("plate_key", metadata.plateKey());
         map.put("capture_index", metadata.captureIndex());
@@ -2387,6 +2812,9 @@ public final class ClonogenicAnalyzer {
         map.put("top_concentration", metadata.topConcentration());
         map.put("bottom_concentration", metadata.bottomConcentration());
         map.put("reverse_column_assignments", metadata.reverseColumnAssignments());
+        for (Map.Entry<String, Object> entry : metadata.imageFields().entrySet()) {
+            map.put(entry.getKey(), entry.getValue());
+        }
         return map;
     }
 
@@ -2397,7 +2825,8 @@ public final class ClonogenicAnalyzer {
     private static List<Map<String, Object>> wellSummariesToMaps(List<WellSummary> summaries) {
         List<Map<String, Object>> rows = new ArrayList<>();
         for (WellSummary summary : summaries) {
-            Map<String, Object> row = new HashMap<>();
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.putAll(summary.extraFields());
             row.put("well_index", summary.wellIndex());
             row.put("row_name", summary.rowName());
             row.put("replicate", summary.replicate());
@@ -2446,10 +2875,11 @@ public final class ClonogenicAnalyzer {
     }
 
     private static void writeGroupSummary(List<Map<String, Object>> wellRows, Path path) throws IOException {
+        List<String> groupFields = resolveSummaryGroupFields(wellRows);
         Map<String, List<Integer>> groups = new HashMap<>();
         Map<String, Map<String, Object>> meta = new HashMap<>();
         for (Map<String, Object> row : wellRows) {
-            String key = row.get("row_name") + "|" + row.get("concentration");
+            String key = buildKey(row, groupFields);
             groups.computeIfAbsent(key, unused -> new ArrayList<>()).add(((Number) row.get("counted_colonies")).intValue());
             meta.putIfAbsent(key, row);
         }
@@ -2463,9 +2893,10 @@ public final class ClonogenicAnalyzer {
                 variance += Math.pow(count - mean, 2.0);
             }
             variance /= Math.max(1, counts.size());
-            Map<String, Object> row = new HashMap<>();
-            row.put("row_name", source.get("row_name"));
-            row.put("concentration", source.get("concentration"));
+            Map<String, Object> row = new LinkedHashMap<>();
+            for (String field : groupFields) {
+                row.put(field, source.get(field));
+            }
             row.put("replicates", counts.size());
             row.put("mean_count", round(mean, 3));
             row.put("std_count", round(Math.sqrt(variance), 3));
@@ -2516,9 +2947,10 @@ public final class ClonogenicAnalyzer {
     }
 
     private static void writeDuplicateGroupSummary(List<Map<String, Object>> wellRows, Path path) throws IOException {
+        List<String> groupFields = resolveSummaryGroupFields(wellRows);
         Map<String, List<Map<String, Object>>> groups = new HashMap<>();
         for (Map<String, Object> row : wellRows) {
-            String key = row.get("plate_key") + "|" + row.get("row_name") + "|" + row.get("concentration");
+            String key = row.get("plate_key") + "|" + buildKey(row, groupFields);
             groups.computeIfAbsent(key, unused -> new ArrayList<>()).add(row);
         }
         List<Map<String, Object>> out = new ArrayList<>();
@@ -2535,12 +2967,13 @@ public final class ClonogenicAnalyzer {
             for (Map<String, Object> row : rows) {
                 images.add(row.get("image_name").toString());
             }
-            Map<String, Object> outRow = new HashMap<>();
+            Map<String, Object> outRow = new LinkedHashMap<>();
             outRow.put("plate_key", first.get("plate_key"));
             outRow.put("dose_gy", first.get("dose_gy"));
             outRow.put("dose_unit", first.get("dose_unit"));
-            outRow.put("row_name", first.get("row_name"));
-            outRow.put("concentration", first.get("concentration"));
+            for (String field : groupFields) {
+                outRow.put(field, first.get(field));
+            }
             outRow.put("image_count", images.size());
             outRow.put("replicate_wells", rows.size());
             outRow.put("mean_count", round(mean, 3));
@@ -2550,6 +2983,73 @@ public final class ClonogenicAnalyzer {
             out.add(outRow);
         }
         writeCsv(path, out);
+    }
+
+    private static List<String> resolveSummaryGroupFields(List<Map<String, Object>> rows) {
+        if (rows.isEmpty()) {
+            return List.of();
+        }
+        if (!SUMMARY_GROUP_FIELDS.isEmpty()) {
+            List<String> resolved = new ArrayList<>();
+            for (String field : SUMMARY_GROUP_FIELDS) {
+                if (rows.getFirst().containsKey(field)) {
+                    resolved.add(field);
+                }
+            }
+            if (!resolved.isEmpty()) {
+                return resolved;
+            }
+        }
+        Set<String> excluded = Set.of(
+            "image_name",
+            "plate_key",
+            "capture_index",
+            "top_concentration",
+            "bottom_concentration",
+            "reverse_column_assignments",
+            "well_index",
+            "replicate",
+            "row_name",
+            "position_label",
+            "raw_component_count",
+            "counted_colonies",
+            "single_area_px",
+            "threshold",
+            "well_area_px",
+            "count_area_px",
+            "analysis_source",
+            "analysis_offset_x_px",
+            "analysis_offset_y_px",
+            "analysis_scale",
+            "well_center_x_px",
+            "well_center_y_px",
+            "global_well_center_x_px",
+            "global_well_center_y_px",
+            "well_radius_px",
+            "rough_center_x_px",
+            "rough_center_y_px",
+            "global_rough_center_x_px",
+            "global_rough_center_y_px",
+            "rough_radius_px"
+        );
+        List<String> inferred = new ArrayList<>();
+        for (String key : rows.getFirst().keySet()) {
+            if (!excluded.contains(key)) {
+                inferred.add(key);
+            }
+        }
+        if (inferred.isEmpty()) {
+            return List.of("well_index");
+        }
+        return inferred;
+    }
+
+    private static String buildKey(Map<String, Object> row, List<String> fields) {
+        StringBuilder builder = new StringBuilder();
+        for (String field : fields) {
+            builder.append(field).append('=').append(row.getOrDefault(field, "")).append('|');
+        }
+        return builder.toString();
     }
 
     private static void writeJson(Path path, Map<String, Object> data) throws IOException {

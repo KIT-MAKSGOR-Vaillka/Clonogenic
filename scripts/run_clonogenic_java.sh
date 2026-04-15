@@ -22,4 +22,4 @@ javac \
   "$SRC_DIR/WellMaskRefiner.java" \
   "$SRC_DIR/ClonogenicAnalyzer.java"
 
-java -cp "$BUILD_DIR:$IJ_JAR" ClonogenicAnalyzer "$@"
+java -Djava.awt.headless=true -cp "$BUILD_DIR:$IJ_JAR" ClonogenicAnalyzer "$@"

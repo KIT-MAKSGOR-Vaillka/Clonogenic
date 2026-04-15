@@ -14,6 +14,8 @@ Thumbs.db
 *.swo
 *~
 .~lock*
+gittnml
+gittnml.pub
 
 # Raw data and local outputs
 data/raw/
