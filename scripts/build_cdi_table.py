@@ -34,7 +34,7 @@ class MatrixBlock:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build CDI verification tables and machine-readable CSV from clonogenic TIFF scan outputs."
+        description="Build CDI tables and machine-readable CSV from clonogenic scan or photo outputs."
     )
     parser.add_argument(
         "--input",
@@ -57,6 +57,14 @@ def parse_args() -> argparse.Namespace:
         "--output-prefix",
         default="cdi_report",
         help="Prefix for generated files.",
+    )
+    parser.add_argument(
+        "--skip-verification",
+        action="store_true",
+        help=(
+            "Only write the adaptive long CSV. Use this for arbitrary dose/concentration "
+            "grids that do not fit the legacy formatted XLSX template."
+        ),
     )
     return parser.parse_args()
 
@@ -399,6 +407,10 @@ def main() -> None:
     verification_xlsx_path = output_prefix.with_name(output_prefix.name + "_verification.xlsx")
 
     write_long_csv(blocks, long_csv_path)
+    if args.skip_verification:
+        print(f"Wrote {long_csv_path}")
+        return
+
     assignments = build_table_assignments(blocks)
     write_verification_csv(assignments, verification_csv_path)
 
